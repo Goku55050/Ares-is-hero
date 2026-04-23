@@ -1,130 +1,87 @@
 const express = require("express");
-const play = require("play-dl");
-const ffmpeg = require("fluent-ffmpeg");
-const ffmpegPath = require("ffmpeg-static");
+const cors = require("cors");
+const { exec } = require("child_process");
 const fs = require("fs");
 const path = require("path");
 
-ffmpeg.setFfmpegPath(ffmpegPath);
-
 const app = express();
-const PORT = process.env.PORT || 3000;
+app.use(cors());
 
-// 📁 Setup
-const MUSIC_DIR = path.join(__dirname, "music");
-if (!fs.existsSync(MUSIC_DIR)) fs.mkdirSync(MUSIC_DIR);
+const MUSIC_DIR = path.join(__dirname, "public", "music");
+const COOKIE_FILE = path.join(__dirname, "cookies.txt");
 
-// 🍪 Load cookies
-if (fs.existsSync("./cookies.json")) {
-    play.setToken({
-        youtube: {
-            cookies: fs.readFileSync("./cookies.json").toString()
-        }
-    });
+// Ensure music directory exists
+if (!fs.existsSync(MUSIC_DIR)) {
+    fs.mkdirSync(MUSIC_DIR, { recursive: true });
 }
 
-// 🔥 Cache (videoId → file URL)
-const cache = new Map();
+/* 🎵 CONVERT & DOWNLOAD API */
+app.get("/download", (req, res) => {
+    let url = req.query.url;
+    if (!url) return res.status(400).json({ error: "No YouTube URL provided" });
 
-// 🔥 Rate limit (IP based)
-const userCooldown = new Map();
-const COOLDOWN = 5000; // 5 sec
+    // Clean up shorts URLs
+    url = url.replace("shorts/", "watch?v=");
 
-// 🔥 Queue
-let processing = false;
-const queue = [];
+    const videoId = Date.now().toString(); // Use timestamp to prevent overwrite collisions
+    const outputPath = path.join(MUSIC_DIR, `${videoId}.mp3`);
 
-/* 🎵 DOWNLOAD */
-app.get("/download", async (req, res) => {
-    const url = req.query.url;
-    const ip = req.ip;
+    // yt-dlp arguments with anti-detection and cookie support
+    const ytDlpArgs = [
+        `yt-dlp`,
+        `--extract-audio`,
+        `--audio-format mp3`,
+        `--audio-quality 0`, // Best quality
+        `--cookies "${COOKIE_FILE}"`, // Pass your YouTube cookies
+        `--geo-bypass`, // Help bypass region locks
+        `--no-playlist`,
+        `--user-agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"`, // Spoof standard browser
+        `-o "${outputPath}"`,
+        `"${url}"`
+    ].join(" ");
 
-    if (!url) return res.json({ success: false, message: "No URL" });
+    console.log(`Starting download for: ${url}`);
 
-    // ⛔ Rate limit
-    if (userCooldown.has(ip)) {
-        const last = userCooldown.get(ip);
-        if (Date.now() - last < COOLDOWN) {
-            return res.json({ success: false, message: "Slow down" });
-        }
-    }
-    userCooldown.set(ip, Date.now());
-
-    try {
-        const info = await play.video_info(url);
-        const videoId = info.video_details.id;
-
-        // ✅ CACHE HIT
-        if (cache.has(videoId)) {
-            return res.json({
-                success: true,
-                audio: cache.get(videoId),
-                cached: true
-            });
+    exec(ytDlpArgs, (error, stdout, stderr) => {
+        if (error) {
+            console.error("YT-DLP ERROR:", stderr);
+            return res.status(500).json({ error: "Failed to process video. It might be blocked or require a captcha update." });
         }
 
-        // 📦 Queue request
-        queue.push({ url, res, videoId });
-        processQueue();
-
-    } catch (err) {
-        res.json({ success: false, message: "Invalid URL" });
-    }
+        res.json({
+            success: true,
+            audio_url: `/music/${videoId}.mp3`
+        });
+    });
 });
 
-/* 🔥 PROCESS QUEUE */
-async function processQueue() {
-    if (processing || queue.length === 0) return;
-
-    processing = true;
-
-    const { url, res, videoId } = queue.shift();
-    const filePath = path.join(MUSIC_DIR, videoId + ".mp3");
-
-    try {
-        const stream = await play.stream(url);
-
-        ffmpeg(stream.stream)
-            .audioBitrate(128)
-            .save(filePath)
-            .on("end", () => {
-                const fileUrl = `/music/${videoId}.mp3`;
-
-                // ✅ Save cache
-                cache.set(videoId, fileUrl);
-
-                res.json({
-                    success: true,
-                    audio: fileUrl,
-                    cached: false
-                });
-
-                processing = false;
-                processQueue();
-            });
-
-    } catch (err) {
-        res.json({ success: false, message: "Download failed" });
-        processing = false;
-        processQueue();
-    }
-}
-
-/* 📁 Serve music */
+/* 📁 SERVE STATIC FILES */
 app.use("/music", express.static(MUSIC_DIR));
 
-/* 🧹 Cleanup old files */
+/* 🧹 AUTO CLEANUP (Every 30 minutes) */
 setInterval(() => {
-    fs.readdirSync(MUSIC_DIR).forEach(file => {
-        const filePath = path.join(MUSIC_DIR, file);
-        const age = Date.now() - fs.statSync(filePath).mtimeMs;
+    try {
+        const files = fs.readdirSync(MUSIC_DIR);
+        const now = Date.now();
 
-        if (age > 1000 * 60 * 30) { // 30 min
-            fs.unlinkSync(filePath);
-        }
-    });
-}, 300000);
+        files.forEach(file => {
+            const filePath = path.join(MUSIC_DIR, file);
+            const stats = fs.statSync(filePath);
+            
+            // Delete if file is older than 30 minutes (1800000 ms)
+            if (now - stats.mtimeMs > 1800000) {
+                fs.unlinkSync(filePath);
+                console.log(`Auto-deleted old file: ${file}`);
+            }
+        });
+    } catch (err) {
+        console.error("Cleanup error:", err);
+    }
+}, 30 * 60 * 1000); 
 
+/* 🚀 START SERVER */
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-    console.log("Server running on port " + PORT);
+    console.log(`Server running on port ${PORT}`);
+    console.log(`Checking for cookies.txt: ${fs.existsSync(COOKIE_FILE) ? "Found!" : "MISSING!"}`);
 });
