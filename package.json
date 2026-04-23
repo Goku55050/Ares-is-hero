@@ -1,0 +1,13 @@
+{
+  "name": "ares-yt-audio-api",
+  "version": "1.0.0",
+  "description": "YouTube to MP3 API with yt-dlp",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "cors": "^2.8.5",
+    "express": "^4.18.2"
+  }
+}
